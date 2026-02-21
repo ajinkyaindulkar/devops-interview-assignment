@@ -1,8 +1,29 @@
-# service.yaml — Video Processing Service
-#
-# TASK: Create a Kubernetes Service for the video-processor deployment.
-#
-# Requirements:
-#   - ClusterIP type
-#   - Selector matches the deployment labels
-#   - Appropriate port configuration
+apiVersion: v1
+kind: Service
+metadata:
+  name: video-processor
+  namespace: video-analytics
+  labels:
+    app: video-processor
+spec:
+  # ClusterIP — the service is only reachable from within the cluster.
+  # video-processor is an internal component: it consumes from Kafka and
+  # writes to S3. No external client calls it directly, so there is no
+  # reason to expose it via NodePort or LoadBalancer. ClusterIP gives it
+  # a stable DNS name (video-processor.video-analytics.svc.cluster.local)
+  # that other pods (e.g. api-gateway) use to route requests to it.
+  type: ClusterIP
+
+  # Selector must exactly match the pod template labels in deployment.yaml.
+  # Only "app: video-processor" is used — not "version" — so that a rolling
+  # update keeps routing traffic to both old and new pods simultaneously
+  # during the rollout window. Selecting on version would drop traffic to the
+  # old pods the moment the new version label appears.
+  selector:
+    app: video-processor
+
+  ports:
+  - name: http
+    port: 8080        # Port the Service listens on (what callers target)
+    targetPort: 8080  # Port the container exposes (containerPort in deployment.yaml)
+    protocol: TCP

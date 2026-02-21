@@ -1,15 +1,399 @@
-# pipeline.yaml — CI/CD Pipeline Definition
+# pipeline.yaml — GitHub Actions CI/CD Pipeline
 #
-# TASK: Define a CI/CD pipeline for the video-analytics application.
-# Use GitHub Actions syntax (or clearly comment which CI system you're targeting).
+# CI system: GitHub Actions
+# Application: video-analytics Java service (Gradle build, Docker container, EKS deployment)
 #
-# Requirements:
-#   - Build stage: compile, run unit tests
-#   - Test stage: integration tests, security scanning
-#   - Deploy to staging: push to ECR, deploy to EKS staging
-#   - Deploy to production: manual approval gate, deploy to EKS prod
-#   - Rollback mechanism on failure
-#   - Notifications on failure
+# Pipeline stages:
+#   1. build       — compile + unit tests (runs on every push / PR)
+#   2. test        — integration tests + Trivy container security scan
+#   3. deploy-staging   — push to ECR + rolling deploy to EKS staging
+#   4. deploy-production — manual approval gate + rolling deploy to EKS prod
+#   5. rollback    — automatic rollback if deploy-staging or deploy-production fails
 #
-# The application is a Java service built with Gradle, containerized,
-# deployed to EKS via kubectl/helm.
+# WHY this ordering matters:
+#   - Fail fast: unit tests run first (seconds) before building a Docker image (minutes)
+#   - Security gate: Trivy blocks pipeline on CRITICAL CVEs before any image reaches ECR,
+#     preventing insecure images from propagating to 100s of edge sites via IMAGE_TAG updates
+#   - Manual approval before production: live customer video is on the line;
+#     a 2-minute human gate costs far less than an unintended prod deploy
+#   - Automatic rollback: keeps MTTR low without requiring a 3am manual intervention
+
+name: video-analytics CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel any in-flight run for the same branch when a newer commit is pushed.
+# WHY: prevents two parallel deploys racing to update EKS, which can leave the
+# cluster in an inconsistent rollout state.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  AWS_REGION:        us-east-1
+  ECR_REGISTRY:      123456789012.dkr.ecr.us-east-1.amazonaws.com
+  ECR_REPOSITORY:    video-ingest
+  EKS_CLUSTER_NAME:  voltai-prod
+  K8S_NAMESPACE:     video-analytics
+  DEPLOYMENT_NAME:   video-processor
+
+# ---------------------------------------------------------------------------
+# STAGE 1: Build and Unit Tests
+#
+# WHY Gradle wrapper (./gradlew) instead of a pre-installed Gradle:
+#   The wrapper pins the Gradle version in the repo — every developer and CI
+#   run uses exactly the same build tool version, preventing "works on my
+#   machine" build differences.
+#
+# WHY cache Gradle dependencies:
+#   A cold Gradle cache download takes 3-5 minutes on a fresh runner.
+#   Caching ~/.gradle/caches cuts this to ~10 seconds on cache hit.
+# ---------------------------------------------------------------------------
+jobs:
+  build:
+    name: Build and Unit Tests
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          distribution: temurin   # Eclipse Temurin — free, LTS, widely used in enterprise Java
+
+      - name: Cache Gradle packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      - name: Build and run unit tests
+        run: ./gradlew build test --no-daemon
+        # --no-daemon: Gradle daemon is not useful in ephemeral CI runners and
+        # can cause port conflicts across parallel jobs on the same host
+
+      - name: Publish unit test results
+        uses: EnricoMi/publish-unit-test-result-action@v2
+        if: always()   # publish results even on test failure so we can see which tests failed
+        with:
+          files: build/test-results/**/*.xml
+
+      - name: Upload JAR artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-jar-${{ github.sha }}
+          path: build/libs/*.jar
+          retention-days: 7
+
+# ---------------------------------------------------------------------------
+# STAGE 2: Integration Tests + Security Scan
+#
+# WHY integration tests run after unit tests (not in parallel):
+#   Integration tests spin up Docker Compose (Kafka, mock S3) — this is
+#   expensive (~2 minutes startup).  We only pay that cost if unit tests pass.
+#
+# WHY Trivy security scan before pushing to ECR:
+#   Building the image and scanning it in CI — before it is tagged and pushed —
+#   means a CRITICAL CVE never enters ECR.  If we scanned after pushing, the
+#   image would be in the registry (and potentially pulled by edge devices via
+#   IMAGE_TAG updates) before we could act.
+# ---------------------------------------------------------------------------
+  test:
+    name: Integration Tests and Security Scan
+    runs-on: ubuntu-22.04
+    needs: build    # only runs after build succeeds
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          distribution: temurin
+
+      - name: Cache Gradle packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      - name: Run integration tests (Docker Compose environment)
+        run: ./gradlew integrationTest --no-daemon
+        # integrationTest task starts docker-compose (Kafka + mock S3 via LocalStack),
+        # runs the test suite, then shuts down containers
+
+      - name: Build Docker image for security scan
+        run: |
+          IMAGE_TAG="${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}"
+          docker build -t "$IMAGE_TAG" .
+          echo "IMAGE_TAG=${IMAGE_TAG}" >> "$GITHUB_ENV"
+
+      - name: Run Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref:    ${{ env.IMAGE_TAG }}
+          format:       sarif
+          output:       trivy-results.sarif
+          severity:     CRITICAL,HIGH
+          exit-code:    "1"    # fail the job on CRITICAL or HIGH — blocks the pipeline
+          # WHY exit-code 1: a container with a CRITICAL vulnerability must NOT reach
+          # production.  The pipeline fails here; the developer must update the base
+          # image or patch the dependency before the next run proceeds.
+
+      - name: Upload Trivy scan results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-results.sarif
+
+# ---------------------------------------------------------------------------
+# STAGE 3: Deploy to Staging
+#
+# Runs only on pushes to main (not on PRs) and only after tests pass.
+#
+# WHY 'kubectl set image' instead of helm upgrade here:
+#   For a rolling image update (same chart, new tag) kubectl set image is
+#   simpler and faster than a full helm upgrade.  Helm is used for
+#   infrastructure-level chart changes (resource limits, replica counts, etc.)
+#   that come from the k8s/ directory.
+#
+# WHY deploy.py status instead of 'kubectl rollout status':
+#   deploy.py wraps kubectl with retries, a configurable timeout, and a
+#   structured exit code — it is more reliable than relying on kubectl's
+#   default 10-minute timeout in a CI context.
+# ---------------------------------------------------------------------------
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-22.04
+    needs: test
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    environment:
+      name: staging
+      url: https://staging.voltai.internal
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC — no long-lived keys)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume:    arn:aws:iam::123456789012:role/github-actions-deploy
+          aws-region:        ${{ env.AWS_REGION }}
+          # WHY OIDC (role-to-assume) instead of AWS_ACCESS_KEY_ID:
+          #   Long-lived IAM access keys are a common leak vector (committed to
+          #   repos, stored in secrets managers that get rotated infrequently).
+          #   OIDC issues a short-lived token per workflow run — no permanent
+          #   credentials to rotate or accidentally expose.
+
+      - name: Log in to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag, and push image to ECR (staging tag)
+        run: |
+          SHORT_SHA="${GITHUB_SHA::8}"
+          IMAGE_TAG="${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${SHORT_SHA}"
+          docker build -t "$IMAGE_TAG" .
+          docker push  "$IMAGE_TAG"
+          # Also tag as 'staging-latest' for easy rollback reference
+          docker tag  "$IMAGE_TAG" \
+            "${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:staging-latest"
+          docker push "${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:staging-latest"
+          echo "SHORT_SHA=${SHORT_SHA}" >> "$GITHUB_ENV"
+          echo "IMAGE_TAG=${IMAGE_TAG}" >> "$GITHUB_ENV"
+
+      - name: Update kubeconfig for staging EKS cluster
+        run: |
+          aws eks update-kubeconfig \
+            --name "${{ env.EKS_CLUSTER_NAME }}-staging" \
+            --region "${{ env.AWS_REGION }}"
+
+      - name: Rolling deploy to staging
+        run: |
+          kubectl set image deployment/${{ env.DEPLOYMENT_NAME }} \
+            ${{ env.DEPLOYMENT_NAME }}="${{ env.IMAGE_TAG }}" \
+            -n "${{ env.K8S_NAMESPACE }}"
+
+      - name: Verify staging rollout
+        run: |
+          python cicd/deploy.py status \
+            --environment staging \
+            --deployment ${{ env.DEPLOYMENT_NAME }} \
+            --namespace   ${{ env.K8S_NAMESPACE }}
+        # deploy.py status polls kubectl rollout status with a 300s timeout and
+        # exits non-zero if the rollout does not complete — this causes the job
+        # to fail and triggers the rollback job below
+
+      - name: Notify Slack on staging deploy success
+        if: success()
+        uses: slackapi/slack-github-action@v1
+        with:
+          payload: |
+            {
+              "text": ":white_check_mark: Staging deploy succeeded: `${{ env.IMAGE_TAG }}` — <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+# ---------------------------------------------------------------------------
+# STAGE 4: Deploy to Production
+#
+# WHY 'environment: production' with a required reviewer:
+#   GitHub protected environments enforce a manual approval from a named
+#   reviewer before the job starts.  This is a hard gate — even if all
+#   automated checks pass, a human must explicitly approve.  The 2-minute
+#   cost of approval is negligible vs. the cost of an accidental prod deploy
+#   on a platform streaming live customer video from 100s of sites.
+#
+# WHY we re-push the image with a stable semver tag:
+#   The staging job tagged the image with the short git SHA.  Production needs
+#   a deterministic tag (e.g. v1.4.3) for the edge device IMAGE_TAG updates
+#   to reference.  We re-tag the already-built image — no rebuild needed.
+# ---------------------------------------------------------------------------
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-22.04
+    needs: deploy-staging
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    environment:
+      name: production
+      url: https://app.voltai.com
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::123456789012:role/github-actions-deploy-prod
+          aws-region:     ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Re-tag staging image with production semver tag
+        run: |
+          SHORT_SHA="${GITHUB_SHA::8}"
+          # Read the version from the Gradle project (build.gradle defines version)
+          APP_VERSION="$(./gradlew properties --no-daemon -q | grep '^version:' | awk '{print $2}')"
+          PROD_TAG="${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${APP_VERSION}"
+          STAGING_TAG="${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${SHORT_SHA}"
+
+          docker pull  "$STAGING_TAG"
+          docker tag   "$STAGING_TAG" "$PROD_TAG"
+          docker push  "$PROD_TAG"
+          echo "PROD_TAG=${PROD_TAG}"     >> "$GITHUB_ENV"
+          echo "APP_VERSION=${APP_VERSION}" >> "$GITHUB_ENV"
+
+      - name: Update kubeconfig for production EKS cluster
+        run: |
+          aws eks update-kubeconfig \
+            --name "${{ env.EKS_CLUSTER_NAME }}" \
+            --region "${{ env.AWS_REGION }}"
+
+      - name: Rolling deploy to production
+        run: |
+          python cicd/deploy.py deploy \
+            --environment production \
+            --image-tag   "${{ env.PROD_TAG }}" \
+            --deployment  ${{ env.DEPLOYMENT_NAME }} \
+            --namespace   ${{ env.K8S_NAMESPACE }}
+          # deploy.py handles: kubectl set image → rollout status poll → health_check()
+          # If health_check() fails within the 300s timeout, deploy.py exits non-zero,
+          # causing this job to fail and triggering the rollback job below
+
+      - name: Notify Slack on production deploy success
+        if: success()
+        uses: slackapi/slack-github-action@v1
+        with:
+          payload: |
+            {
+              "text": ":rocket: Production deploy succeeded: `${{ env.APP_VERSION }}` — <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+# ---------------------------------------------------------------------------
+# STAGE 5: Automatic Rollback
+#
+# WHY trigger on workflow_run failure instead of a step-level `if: failure()`:
+#   A step-level `if: failure()` only runs if the step's own job failed.
+#   Using 'needs' with failure() in the condition ensures rollback fires
+#   whether staging OR production deploy failed — one rollback job covers both.
+#
+# WHY rollback to the previous revision rather than a named tag:
+#   'kubectl rollout undo' reverts to the ReplicaSet that was previously ACTIVE.
+#   This is safe even if the "previous" image was also recently deployed —
+#   Kubernetes tracks rollout history and always has a known-good state to
+#   return to as long as revisionHistoryLimit > 0 (default 10).
+# ---------------------------------------------------------------------------
+  rollback:
+    name: Automatic Rollback on Failure
+    runs-on: ubuntu-22.04
+    needs: [deploy-staging, deploy-production]
+    if: failure()   # runs if either deploy job fails
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::123456789012:role/github-actions-deploy-prod
+          aws-region:     ${{ env.AWS_REGION }}
+
+      - name: Determine which environment to roll back
+        id: env-detect
+        run: |
+          # If deploy-production failed, roll back production.
+          # If only deploy-staging failed, roll back staging.
+          if [[ "${{ needs.deploy-production.result }}" == "failure" ]]; then
+            echo "rollback_env=production" >> "$GITHUB_OUTPUT"
+            echo "cluster=${{ env.EKS_CLUSTER_NAME }}"          >> "$GITHUB_OUTPUT"
+          else
+            echo "rollback_env=staging"    >> "$GITHUB_OUTPUT"
+            echo "cluster=${{ env.EKS_CLUSTER_NAME }}-staging"  >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Update kubeconfig for rollback target cluster
+        run: |
+          aws eks update-kubeconfig \
+            --name "${{ steps.env-detect.outputs.cluster }}" \
+            --region "${{ env.AWS_REGION }}"
+
+      - name: Execute rollback
+        run: |
+          python cicd/deploy.py rollback \
+            --environment "${{ steps.env-detect.outputs.rollback_env }}" \
+            --deployment  ${{ env.DEPLOYMENT_NAME }} \
+            --namespace   ${{ env.K8S_NAMESPACE }}
+
+      - name: Notify Slack of rollback
+        uses: slackapi/slack-github-action@v1
+        with:
+          payload: |
+            {
+              "text": ":warning: Deploy failed — automatic rollback executed for *${{ steps.env-detect.outputs.rollback_env }}*. Commit: `${{ github.sha }}`. <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}

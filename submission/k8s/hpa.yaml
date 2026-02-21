@@ -1,8 +1,81 @@
-# hpa.yaml — Horizontal Pod Autoscaler
-#
-# TASK: Create an HPA for the video-processor deployment.
-#
-# Requirements:
-#   - Min and max replica counts
-#   - CPU and/or memory metrics with target utilization
-#   - Consider: what scaling behavior makes sense for a video processing workload?
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: video-processor
+  namespace: video-analytics
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: video-processor
+
+  # minReplicas: 2 — never drop below 2 pods regardless of load.
+  # One pod handles traffic while the other is a standby; a single-pod setup
+  # means any restart (OOMKill, node drain, rolling update) causes full downtime.
+  # maxReplicas: 10 — upper bound to prevent runaway scaling from a traffic spike
+  # or a metric anomaly from provisioning unbounded (and unbilled) capacity.
+  minReplicas: 2
+  maxReplicas: 10
+
+  metrics:
+  # -------------------------------------------------------------------------
+  # Primary metric: CPU utilisation
+  # Video processing is CPU-bound (frame decode, inference pre/post-processing).
+  # Target 70% — leaves 30% headroom so a sudden burst doesn't saturate pods
+  # before new ones come online (EKS node spin-up + pod scheduling takes ~2 min).
+  # -------------------------------------------------------------------------
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+
+  # -------------------------------------------------------------------------
+  # Secondary metric: memory utilisation
+  # Caution: Java (JVM) holds allocated heap even when idle, so memory usage
+  # does not drop cleanly between jobs. This metric guards against pathological
+  # memory growth (e.g. a frame buffer leak filling the 2Gi limit) rather than
+  # being used as a load signal. Set conservatively at 80% — if average
+  # utilisation across pods reaches 80% of the 2Gi limit (1.6Gi), something
+  # is accumulating and we should scale out before OOMKill occurs.
+  # -------------------------------------------------------------------------
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+
+  behavior:
+    scaleUp:
+      # -----------------------------------------------------------------------
+      # Scale up fast — video workloads spike sharply when many cameras upload
+      # simultaneously (e.g. motion events across a site at the same time).
+      # stabilizationWindowSeconds: 60 — wait 60s of sustained high load before
+      # scaling up, filtering out transient 1-2 minute spikes that would resolve
+      # themselves. Too long and pods saturate; too short and we thrash.
+      # Policy: add up to 3 pods per 60s — enough to absorb a burst without
+      # over-provisioning before the first wave of new pods starts serving.
+      # -----------------------------------------------------------------------
+      stabilizationWindowSeconds: 60
+      policies:
+      - type: Pods
+        value: 3
+        periodSeconds: 60
+
+    scaleDown:
+      # -----------------------------------------------------------------------
+      # Scale down slowly — Java pods take 30-60s to start (JVM warmup, Kafka
+      # consumer rebalance). Scaling down too aggressively then back up creates
+      # a sawtooth pattern with repeated rebalance penalties.
+      # stabilizationWindowSeconds: 300 — only scale down after 5 consecutive
+      # minutes of low utilisation, preventing flapping on brief quiet periods.
+      # Policy: remove at most 1 pod per 120s — gradual drain gives Kafka time
+      # to rebalance partitions away from the departing consumer gracefully.
+      # -----------------------------------------------------------------------
+      stabilizationWindowSeconds: 300
+      policies:
+      - type: Pods
+        value: 1
+        periodSeconds: 120

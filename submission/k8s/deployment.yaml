@@ -1,16 +1,3 @@
-# deployment.yaml — Video Processing Service Deployment
-#
-# TASK: Complete this deployment manifest for a production video processing service.
-#
-# Requirements:
-#   - Resource requests and limits (CPU + memory)
-#   - Liveness and readiness probes
-#   - Security context (non-root, read-only root filesystem)
-#   - Anti-affinity or topology spread constraints
-#   - Image tag should NOT be :latest
-#   - Reference the ConfigMap you create in configmap.yaml
-#   - Environment variables for service configuration
-
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -27,17 +14,157 @@ spec:
     metadata:
       labels:
         app: video-processor
+        version: v2.4.0
     spec:
+      # -------------------------------------------------------------------------
+      # Pod-level security context
+      # runAsNonRoot + runAsUser prevent the process from running as root, which
+      # limits the blast radius if the container is compromised — an attacker
+      # cannot escalate to host root via a container escape.
+      # fsGroup ensures mounted volumes are owned by the app user so the process
+      # can write to emptyDir volumes without root permissions.
+      # -------------------------------------------------------------------------
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+
+      # -------------------------------------------------------------------------
+      # Topology spread — distribute pods across nodes so a single node failure
+      # doesn't take down all 3 replicas. maxSkew: 1 means at most one node can
+      # have one extra pod compared to any other. whenUnsatisfiable: DoNotSchedule
+      # prevents the scheduler from stacking pods on one node when spread can't
+      # be achieved (e.g. cluster too small) — fail loudly rather than silently.
+      # -------------------------------------------------------------------------
+      topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: DoNotSchedule
+        labelSelector:
+          matchLabels:
+            app: video-processor
+
       containers:
       - name: video-processor
-        image: # TODO: Set image with a specific tag (not :latest)
+        # Pinned to v2.4.0 — never :latest in production. Using :latest makes
+        # rollbacks impossible (you can't distinguish which image is running)
+        # and breaks reproducibility across environments.
+        image: 123456789012.dkr.ecr.us-east-1.amazonaws.com/video-processor:v2.4.0
         ports:
         - containerPort: 8080
           name: http
-        # TODO: Add resource requests and limits
-        # TODO: Add liveness probe
-        # TODO: Add readiness probe
-        # TODO: Add security context
-        # TODO: Add environment variables (reference ConfigMap)
-      # TODO: Add pod-level security context
-      # TODO: Add anti-affinity or topology spread constraints
+
+        # -----------------------------------------------------------------------
+        # Resource requests and limits
+        # Requests: what the scheduler uses to place the pod on a node.
+        # Limits: hard ceiling — exceeding memory limit causes OOMKill.
+        #
+        # Lesson from Scenario 1: the pod was OOMKilled with a 512Mi limit while
+        # running 8 threads with -Xmx384m. Java heap alone was 384Mi, leaving
+        # only 128Mi for off-heap (metaspace, thread stacks, GC buffers, native).
+        # With PROCESSING_THREADS reduced to 4 and limit raised to 2Gi:
+        #   -Xmx1536m (1.5Gi heap) + ~512Mi off-heap = fits within 2Gi comfortably.
+        # -----------------------------------------------------------------------
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "1Gi"
+          limits:
+            cpu: "2000m"
+            memory: "2Gi"
+
+        # -----------------------------------------------------------------------
+        # Liveness probe — answers "is this pod alive or should it be restarted?"
+        # A failing liveness probe triggers a container restart.
+        # initialDelaySeconds: 60 — Java services take 30-60s to fully start;
+        # probing too early would immediately restart a healthy-but-still-booting
+        # pod, creating a restart loop before the app is even up.
+        # -----------------------------------------------------------------------
+        livenessProbe:
+          httpGet:
+            path: /health/live
+            port: 8080
+          initialDelaySeconds: 60
+          periodSeconds: 15
+          failureThreshold: 3
+          timeoutSeconds: 5
+
+        # -----------------------------------------------------------------------
+        # Readiness probe — answers "is this pod ready to receive traffic?"
+        # A failing readiness probe removes the pod from Service endpoints without
+        # restarting it. This is critical during startup and Kafka consumer rebalance:
+        # the pod stays alive but doesn't receive requests until it is truly ready.
+        # Shorter initialDelay than liveness so the pod joins the endpoint pool as
+        # soon as it's ready, not after waiting the full liveness delay.
+        # -----------------------------------------------------------------------
+        readinessProbe:
+          httpGet:
+            path: /health/ready
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          failureThreshold: 3
+          timeoutSeconds: 5
+
+        # -----------------------------------------------------------------------
+        # Container-level security context
+        # allowPrivilegeEscalation: false — prevents setuid binaries from gaining
+        # more privileges than the parent process (e.g. sudo, su).
+        # readOnlyRootFilesystem: true — the container cannot write to its own
+        # image layers. Any write attempt goes to an explicitly declared volume,
+        # making it obvious what writable state the app needs. Reduces risk of
+        # an attacker persisting malware inside the container filesystem.
+        # capabilities drop ALL — the process starts with zero Linux capabilities.
+        # A video processing service needs none; dropping all is zero-cost and
+        # eliminates an entire class of privilege escalation vectors.
+        # -----------------------------------------------------------------------
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+
+        # -----------------------------------------------------------------------
+        # Environment variables
+        # Non-sensitive config pulled from ConfigMap via envFrom — the pod
+        # inherits all keys as env vars automatically. New config keys added to
+        # the ConfigMap are available after a rollout without changing this file.
+        # JAVA_OPTS is set directly here (not in the ConfigMap) because the heap
+        # size (-Xmx) must be derived from this container's memory limit. Keeping
+        # it here makes the relationship between limit and heap explicit.
+        # -----------------------------------------------------------------------
+        envFrom:
+        - configMapRef:
+            name: video-processor-config
+        env:
+        - name: JAVA_OPTS
+          # -Xmx1536m: 1.5Gi heap — leaves 512Mi for off-heap within the 2Gi limit
+          # -Xms512m: start heap allocation at 512Mi to avoid GC pressure on startup
+          # G1GC: better pause time predictability than ParallelGC for video workloads
+          value: "-Xmx1536m -Xms512m -XX:+UseG1GC -XX:MaxGCPauseMillis=200"
+
+        # -----------------------------------------------------------------------
+        # Volume mounts
+        # /tmp is required because readOnlyRootFilesystem: true blocks all writes
+        # to the container filesystem. Java and many libraries write to /tmp for
+        # temp files, sockets, and lock files. An emptyDir satisfies this without
+        # granting write access to the image layers.
+        # /var/video-buffer is the local video chunk staging area used before
+        # S3 upload. A separate emptyDir with a size limit prevents a single pod
+        # from exhausting node disk by buffering too many chunks.
+        # -----------------------------------------------------------------------
+        volumeMounts:
+        - name: tmp-dir
+          mountPath: /tmp
+        - name: video-buffer
+          mountPath: /var/video-buffer
+
+      volumes:
+      - name: tmp-dir
+        emptyDir: {}
+      - name: video-buffer
+        emptyDir:
+          # Cap at 5Gi per pod — with 3 replicas this limits total node disk
+          # consumption from video buffering to a predictable 15Gi maximum.
+          sizeLimit: 5Gi

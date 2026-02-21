@@ -1,8 +1,91 @@
-# networkpolicy.yaml — Network Policy
-#
-# TASK: Create a NetworkPolicy for the video-processor pods.
-#
-# Requirements:
-#   - Restrict ingress to only necessary sources
-#   - Consider what services need to communicate with the video processor
-#   - Default deny is a good starting point
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: video-processor
+  namespace: video-analytics
+spec:
+  # This policy applies to all pods labelled app: video-processor
+  podSelector:
+    matchLabels:
+      app: video-processor
+
+  # Declaring both Ingress and Egress under policyTypes activates default-deny
+  # for both directions. Any traffic not explicitly permitted below is dropped.
+  # This is the correct posture for an internal processing service — no
+  # implicit trust between pods in the same namespace.
+  policyTypes:
+  - Ingress
+  - Egress
+
+  ingress:
+  # ---------------------------------------------------------------------------
+  # Rule 1: Allow inbound HTTP from api-gateway pods only.
+  # The api-gateway is the only service that routes external requests to the
+  # video-processor. No other pod in the namespace should call it directly.
+  # Matching on podSelector (not IP) is resilient to pod restarts and scaling.
+  # ---------------------------------------------------------------------------
+  - from:
+    - podSelector:
+        matchLabels:
+          app: api-gateway
+    ports:
+    - protocol: TCP
+      port: 8080
+
+  # ---------------------------------------------------------------------------
+  # Rule 2: Allow Prometheus to scrape metrics on port 8080.
+  # Prometheus runs in the "monitoring" namespace. The namespaceSelector ensures
+  # only pods from that specific namespace (not any namespace containing a pod
+  # labelled app: prometheus) can scrape. Both selectors are combined with AND
+  # inside a single `from` entry — the scraper pod must satisfy both conditions.
+  # ---------------------------------------------------------------------------
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: monitoring
+      podSelector:
+        matchLabels:
+          app: prometheus
+    ports:
+    - protocol: TCP
+      port: 8080
+
+  egress:
+  # ---------------------------------------------------------------------------
+  # Rule 3: Allow outbound to Kafka (Amazon MSK) on port 9092.
+  # video-processor publishes inference results to Kafka after each chunk is
+  # processed. Port 9092 = plaintext; use 9094 if MSK TLS is enforced.
+  # Matched by pod label within the namespace — if MSK is external (not a
+  # pod), replace podSelector with an ipBlock pointing to the MSK broker CIDRs.
+  # ---------------------------------------------------------------------------
+  - to:
+    - podSelector:
+        matchLabels:
+          app: kafka
+    ports:
+    - protocol: TCP
+      port: 9092
+
+  # ---------------------------------------------------------------------------
+  # Rule 4: Allow outbound HTTPS (443) for S3 uploads.
+  # Video chunks are uploaded to S3 via the VPC endpoint (no NAT required after
+  # cost_optimization.tf applied the Gateway endpoint). The destination is an
+  # AWS-managed IP so we allow port 443 broadly for egress — this also covers
+  # Secrets Manager and any other AWS API calls the app may make.
+  # ---------------------------------------------------------------------------
+  - ports:
+    - protocol: TCP
+      port: 443
+
+  # ---------------------------------------------------------------------------
+  # Rule 5: Allow outbound DNS (UDP + TCP on 53) to kube-dns.
+  # Without this, all service name resolution (kafka, S3 endpoint, health
+  # check targets) fails silently — pods get connection refused on startup
+  # and the readiness probe never passes. DNS is required for every egress rule
+  # that uses a hostname rather than a raw IP.
+  # ---------------------------------------------------------------------------
+  - ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53

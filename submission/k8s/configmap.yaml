@@ -1,7 +1,47 @@
-# configmap.yaml — Video Processor Configuration
-#
-# TASK: Create a ConfigMap for the video-processor deployment.
-#
-# Requirements:
-#   - Application configuration values (e.g., log level, Kafka broker, S3 bucket)
-#   - This ConfigMap should be referenced in your deployment.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: video-processor-config
+  namespace: video-analytics
+  labels:
+    app: video-processor
+data:
+  # ---------------------------------------------------------------------------
+  # Logging
+  # INFO in production — DEBUG would flood CloudWatch and inflate log costs.
+  # Switch to DEBUG at runtime via a rollout if deep tracing is needed.
+  # ---------------------------------------------------------------------------
+  LOG_LEVEL: "INFO"
+
+  # ---------------------------------------------------------------------------
+  # Kafka (Amazon MSK)
+  # Broker list injected here so it can differ between staging and production
+  # without changing the container image. Port 9092 = plaintext within VPC;
+  # use 9094 (TLS) if MSK encryption-in-transit is enabled.
+  # ---------------------------------------------------------------------------
+  KAFKA_BROKER: "b-1.video-analytics.msk.us-east-1.amazonaws.com:9092"
+  KAFKA_TOPIC: "video-inference-results"
+  # Consumer group ID is shared across all replicas so Kafka distributes
+  # partition ownership — each chunk is processed by exactly one pod.
+  KAFKA_GROUP_ID: "video-processor-group"
+
+  # ---------------------------------------------------------------------------
+  # S3 (matches bucket name in cost_optimization.tf and aws_cost_report.json)
+  # ---------------------------------------------------------------------------
+  S3_BUCKET: "vlt-video-chunks-prod"
+  S3_REGION: "us-east-1"
+  # Timeout for a single chunk upload attempt before the retry kicks in.
+  # 30s accommodates large chunks (50 Mbps link × 30s = 187 MB max chunk).
+  UPLOAD_TIMEOUT_SECONDS: "30"
+  MAX_RETRY_ATTEMPTS: "3"
+
+  # ---------------------------------------------------------------------------
+  # Processing tuning
+  # Threads set to 4 (not 8 as in the OOMKilled pod from Scenario 1).
+  # Each thread holds a frame buffer in-heap; 8 threads at 512Mi limit left
+  # no headroom and triggered OOMKill. 4 threads fits safely within 1.5Gi heap.
+  # BATCH_SIZE controls how many frames are batched per inference call —
+  # smaller batch = lower latency, larger batch = higher GPU utilisation.
+  # ---------------------------------------------------------------------------
+  PROCESSING_THREADS: "4"
+  BATCH_SIZE: "25"
